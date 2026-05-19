@@ -93,6 +93,64 @@ Now multiply by 3 environments (dev, qa, prod) and 9 services:
 | **Helm + Kustomize native** | Renders templates server-side; no `helm install` needed | ArgoCD runs `helm template` internally every 3 min |
 | **Multi-cluster** | One ArgoCD can manage many clusters | Not in today's lab, but this is how prod teams run it |
 
+### ArgoCD UI walkthrough — where to find each feature
+
+Open the ArgoCD UI (`https://<argocd-server>`) and navigate to any application (e.g., `auth-service-dev-raw`).
+
+**App list view**
+
+```
+Apps screen → each tile shows:
+  ● Synced / OutOfSync badge     ← did the cluster drift from Git?
+  ● Healthy / Degraded badge     ← are pods actually running?
+  ● Last sync timestamp + commit SHA
+```
+
+**App detail view — three key tabs**
+
+| Tab | What to look at | Feature demonstrated |
+|---|---|---|
+| **Summary** | Sync Policy section | Toggle Auto-Sync, Self-Heal, Prune |
+| **Diff** | Orange = live state, Green = desired (Git) | What ArgoCD will change on next sync |
+| **History & Rollback** | Every row = one sync tied to a Git commit | Click "Rollback" → cluster reverts to that SHA |
+
+**Self-heal in the UI**
+
+```
+App detail → Summary tab → Sync Policy panel
+  ✅ Auto-Sync       ← enabled = ArgoCD syncs on every Git push
+  ✅ Self Heal       ← enabled = manual cluster changes get reverted
+  ✅ Prune Resources ← enabled = resources removed from Git get deleted
+```
+
+**Prune demo — live in the UI**
+
+1. Remove one manifest from Git, push the commit
+2. App goes **OutOfSync** — the resource tile turns orange with a trash icon
+3. Without `prune: true`: ArgoCD marks it OutOfSync but leaves the resource alive
+4. With `prune: true`: ArgoCD deletes it — tile disappears from the app graph
+
+**Sync Options button**
+
+Top-right of app detail → "Sync" → modal shows checkboxes:
+- **Prune** — delete orphaned resources this sync only
+- **Force** — replace resources (useful if immutable field changed)
+- **Dry Run** — compute the diff without applying it (safe preview)
+- **Apply Only** — skip pre/post sync hooks
+
+**App graph / resource tree**
+
+The visual tree on the App detail page shows every K8s object that belongs to this Application:
+```
+Application
+└── Deployment: auth-service
+    └── ReplicaSet
+        └── Pod (green = Healthy, yellow = Progressing, red = Degraded)
+└── Service: auth-service
+└── ConfigMap: auth-service-config
+```
+Click any node → live YAML on the right, Events tab below.
+
 ---
 
 ## 4. ArgoCD Components (10 min)
@@ -212,6 +270,49 @@ spec:
                 port:
                   number: 8080
 ```
+
+### How pharma-ui talks to backend microservices
+
+The React frontend is a **browser app** — it never talks directly to supplier, auth, or order services from inside the cluster. Every API call goes out through the browser, hits the LoadBalancer, and is routed by NGINX.
+
+```
+Browser (React SPA)
+     │
+     │  fetch("/api/suppliers")        ← relative URL, no hardcoded host
+     │  fetch("/api/orders")
+     │  fetch("/api/auth/login")
+     ▼
+AWS LoadBalancer  (same LB, same IP as the UI)
+     │
+     ▼
+NGINX Ingress Controller
+     │  path: /api  →  api-gateway:8080
+     ▼
+api-gateway  (Spring Boot)
+     │  routes by sub-path:
+     ├── /api/suppliers   →  supplier-service:8080   (ClusterIP)
+     ├── /api/orders      →  order-service:8080       (ClusterIP)
+     ├── /api/auth        →  auth-service:8080        (ClusterIP)
+     └── /api/products    →  product-service:8080     (ClusterIP)
+```
+
+**Key points:**
+- `pharma-ui` uses **relative URLs** (e.g., `/api/suppliers`) — it never needs to know the cluster-internal hostname of supplier-service
+- NGINX strips `/api` (or passes it through) and forwards to `api-gateway`
+- `api-gateway` routes to individual services using **Kubernetes DNS**: `http://supplier-service.dev.svc.cluster.local:8080`
+- Services below `api-gateway` are pure `ClusterIP` — no Ingress, unreachable from outside
+
+**Microservice-to-microservice calls (server-side only)**
+
+When `api-gateway` (or `order-service`) calls another service, it uses the cluster DNS name directly — it never leaves the cluster:
+
+```
+api-gateway pod
+  → http://supplier-service:8080/suppliers      (same namespace, short name works)
+  → http://auth-service.dev.svc.cluster.local   (cross-namespace, full FQDN)
+```
+
+**Why this matters for GitOps:** The `api-gateway` routing rules (Spring Cloud Gateway routes or Nginx config) live in the service's `ConfigMap` or `application.yaml` — those are in Git, versioned, and synced by ArgoCD like everything else.
 
 ### Common Ingress error codes
 
