@@ -45,26 +45,43 @@ success "Cluster reachable: $CLUSTER"
 echo ""
 info "=== STEP 1: EBS CSI Driver ==="
 
-# 1a. IRSA — skip if role already annotated on the service account
-if kubectl get serviceaccount "$EBS_SA" -n kube-system \
-     -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' \
-     2>/dev/null | grep -q "arn:aws:iam"; then
-  success "IRSA role already exists on $EBS_SA — skipping creation"
-else
-  info "Creating IRSA role for EBS CSI controller..."
-  eksctl create iamserviceaccount \
-    --name "$EBS_SA" \
-    --namespace kube-system \
-    --cluster "$CLUSTER" \
-    --region "$REGION" \
-    --attach-policy-arn "$EBS_POLICY" \
-    --approve \
-    --override-existing-serviceaccounts
-  success "IRSA role created"
-fi
+# 1a. IRSA — resolve role ARN from SA annotation, CloudFormation stack, or create fresh
+CF_STACK="eksctl-${CLUSTER}-addon-iamserviceaccount-kube-system-${EBS_SA}"
 
 EBS_ROLE_ARN=$(kubectl get serviceaccount "$EBS_SA" -n kube-system \
-  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
+  -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' 2>/dev/null || true)
+
+if [[ -n "$EBS_ROLE_ARN" ]]; then
+  success "IRSA role already exists on $EBS_SA — skipping creation"
+else
+  # SA missing but CF stack may still exist — get ARN from stack output
+  EBS_ROLE_ARN=$(aws cloudformation describe-stacks \
+    --stack-name "$CF_STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[0].OutputValue' --output text 2>/dev/null || true)
+
+  if [[ -n "$EBS_ROLE_ARN" && "$EBS_ROLE_ARN" != "None" ]]; then
+    warn "CF stack exists but SA is missing — recreating service account only"
+    kubectl create serviceaccount "$EBS_SA" -n kube-system --dry-run=client -o yaml \
+      | kubectl apply -f -
+    kubectl annotate serviceaccount "$EBS_SA" -n kube-system \
+      eks.amazonaws.com/role-arn="$EBS_ROLE_ARN" --overwrite
+    success "Service account recreated with existing role ARN"
+  else
+    info "Creating IRSA role for EBS CSI controller..."
+    eksctl create iamserviceaccount \
+      --name "$EBS_SA" \
+      --namespace kube-system \
+      --cluster "$CLUSTER" \
+      --region "$REGION" \
+      --attach-policy-arn "$EBS_POLICY" \
+      --approve \
+      --override-existing-serviceaccounts
+    EBS_ROLE_ARN=$(kubectl get serviceaccount "$EBS_SA" -n kube-system \
+      -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
+    success "IRSA role created"
+  fi
+fi
+
 info "EBS CSI role ARN: $EBS_ROLE_ARN"
 
 # 1b. Install addon — skip if already ACTIVE
